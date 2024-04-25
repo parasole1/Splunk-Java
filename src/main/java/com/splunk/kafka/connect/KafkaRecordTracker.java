@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
@@ -39,6 +40,7 @@ final class KafkaRecordTracker {
     private ConcurrentLinkedQueue<EventBatch> failed;
     private volatile Map<TopicPartition, OffsetAndMetadata> offsets;
     private Collection<TopicPartition> partitions;
+    private AtomicBoolean removingEventsInProgress = new AtomicBoolean(false);
 
     public KafkaRecordTracker() {
         all = new ConcurrentHashMap<>();
@@ -58,33 +60,56 @@ final class KafkaRecordTracker {
         log.debug("received acked event batches={}", batches);
         /* Loop all *assigned* partitions to find the lowest consecutive
          * HEC-commited offsets. A batch could contain events coming from a
-         * variety of topic/partitions, and scanning those events coulb be
+         * variety of topic/partitions, and scanning those events could be
          * expensive.
          * Note that if some events are tied to an unassigned partition those
-         * offsets won't be able to be commited.
+         * offsets won't be able to be committed.
          */
-        for (TopicPartition tp : partitions) {
-            ConcurrentNavigableMap<Long, EventBatch> tpRecords = all.get(tp);
-            if (tpRecords == null) {
-                continue;  // nothing to remove in this case
-            }
-            long offset = -1;
-            Iterator<Map.Entry<Long, EventBatch>> iter = tpRecords.entrySet().iterator();
-            for (; iter.hasNext();) {
-                Map.Entry<Long, EventBatch> e = iter.next();
-                if (e.getValue().isCommitted()) {
-                    log.debug("processing offset {}", e.getKey());
-                    offset = e.getKey();
-                    iter.remove();
-                    total.decrementAndGet();
-                } else {
-                    break;
+        // With the current implementation, we don't need to let multiple threads cleaning events in parallel.
+        if (removingEventsInProgress.compareAndSet(false, true)) {
+            try {
+                long countOfEventsToRemove = 0;
+
+                for (TopicPartition tp : partitions) {
+                    ConcurrentNavigableMap<Long, EventBatch> tpRecords = all.get(tp);
+                    if (tpRecords == null) {
+                        continue;  // nothing to remove in this case
+                    }
+                    long offset = -1;
+                    Iterator<Map.Entry<Long, EventBatch>> iter = tpRecords.entrySet().iterator();
+                    for (; iter.hasNext(); ) {
+                        Map.Entry<Long, EventBatch> e = iter.next();
+                        if (e.getValue().isCommitted()) {
+                            log.debug("processing offset {}", e.getKey());
+                            offset = e.getKey();
+                            iter.remove();
+                            countOfEventsToRemove++;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (offset >= 0) {
+                        offsets.put(tp, new OffsetAndMetadata(offset + 1));
+                    }
                 }
-            }
-            if (offset >= 0) {
-                offsets.put(tp, new OffsetAndMetadata(offset + 1));
+                decrementTotalEventCount(countOfEventsToRemove);
+            } finally {
+                removingEventsInProgress.set(false);
             }
         }
+    }
+
+    private void decrementTotalEventCount(long countOfEventsToRemove) {
+        total.getAndUpdate(current -> {
+            if (current < countOfEventsToRemove) {
+                log.warn("Total event count ({}) is lower than the count ({}) we try to remove, resetting to 0",
+                        current,
+                        countOfEventsToRemove);
+                return 0;
+            } else {
+                return current - countOfEventsToRemove;
+            }
+        });
     }
 
     public void addFailedEventBatch(final EventBatch batch) {
@@ -180,7 +205,7 @@ final class KafkaRecordTracker {
             log.warn("purge events={} from closed partitions={}",
                      countOfEventsToRemove, partitions);
             all.keySet().removeAll(partitions);
-            total.addAndGet(-1L * countOfEventsToRemove);
+            decrementTotalEventCount(countOfEventsToRemove);
         }
     }
 }
