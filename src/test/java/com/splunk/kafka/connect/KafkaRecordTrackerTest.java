@@ -27,6 +27,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class KafkaRecordTrackerTest {
     @Test
@@ -48,6 +52,38 @@ public class KafkaRecordTrackerTest {
         tracker.addFailedEventBatch(batch);
     }
 
+    @Test
+    public void removeEventBatchMultiThread() {
+        List<EventBatch> batches = new ArrayList<>();
+        KafkaRecordTracker tracker = new KafkaRecordTracker();
+        tracker.open(createTopicPartitionList(500));
+
+        for (int i = 0; i < 100; i++) {
+            EventBatch batch = UnitUtil.createMultiBatch(500);
+            for (int j = 0; j < 500; j++) {
+                batch.getEvents().get(j).setTied(createSinkRecord(j, i * 1000 + j));
+            }
+            batch.commit();
+            batches.add(batch);
+            tracker.addEventBatch(batch);
+        }
+
+        Assert.assertEquals(50000, tracker.totalEvents());
+        ExecutorService executorService = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = executorService.submit(() -> tracker.removeAckedEventBatches(batches));
+            Future<?> second = executorService.submit(() -> tracker.removeAckedEventBatches(batches));
+
+            first.get();
+            second.get();
+        } catch (ExecutionException | InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            executorService.shutdown();
+        }
+
+        Assert.assertEquals(0, tracker.totalEvents());
+    }
     @Test
     public void addEventBatch() {
         List<EventBatch> batches = new ArrayList<>();
@@ -102,6 +138,18 @@ public class KafkaRecordTrackerTest {
     private List<TopicPartition> createTopicPartitionList() {
         ArrayList<TopicPartition> tps = new ArrayList<>();
         tps.add(new TopicPartition("t", 1));
+        return tps;
+    }
+
+    private SinkRecord createSinkRecord(int partition, long offset) {
+        return new SinkRecord("t", partition, null, null, null, "ni, hao", offset);
+    }
+
+    private List<TopicPartition> createTopicPartitionList(int number) {
+        ArrayList<TopicPartition> tps = new ArrayList<>();
+        for (int i = 0; i < number; i++) {
+            tps.add(new TopicPartition("t", i));
+        }
         return tps;
     }
 }

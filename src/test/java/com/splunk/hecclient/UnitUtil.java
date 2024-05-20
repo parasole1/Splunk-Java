@@ -35,6 +35,15 @@ public class UnitUtil {
         return batch;
     }
 
+    public static EventBatch createMultiBatch(int count) {
+        EventBatch batch = new JsonEventBatch();
+        for (int i = 0; i < count; i++) {
+            Event event = new JsonEvent("ni-" + i, "hao-" + i);
+            batch.add(event);
+        }
+        return batch;
+    }
+
     public static EventBatch createRawEventBatch() {
         Event event = new RawEvent("ni", "hao");
         EventBatch batch = RawEventBatch.factory().build();
